@@ -1,0 +1,1 @@
+Maya AI Android project is ready. GitHub Actions should build the debug APK on pushes to main.
