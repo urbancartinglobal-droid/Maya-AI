@@ -1,0 +1,1 @@
+<resources><style name="Theme.Maya" parent="Theme.MaterialComponents.DayNight.NoActionBar"><item name="android:fontFamily">sans</item><item name="android:colorAccent">#E91E63</item><item name="android:navigationBarColor">#10131A</item><item name="android:statusBarColor">#10131A</item></style></resources>
