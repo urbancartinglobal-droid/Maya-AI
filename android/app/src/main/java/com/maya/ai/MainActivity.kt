@@ -1,6 +1,7 @@
 package com.maya.ai
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
 import android.media.*
 import android.os.Bundle
@@ -15,6 +16,7 @@ import okio.ByteString
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Base64
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
@@ -23,10 +25,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var keyInput: EditText
     private lateinit var button: Button
     private var ws: WebSocket? = null
-    private var recording = false
-    private var playing = false
+    @Volatile private var recording = false
+    @Volatile private var playing = false
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
+    private var playbackThread: Thread? = null
+    private val audioQueue = LinkedBlockingQueue<ByteArray>()
     private val model = "gemini-3.1-flash-live-preview"
     private val instruction = """
 You are Maya, a cute, caring female voice assistant and girlfriend-style character. Always speak in natural Hindi or Hinglish. Be warm, loving, respectful and helpful. You may naturally call the user janu, sona or baby when appropriate. If the user says I love you, reply I love you too. Your name is Maya.
@@ -68,6 +72,7 @@ You are Maya, a cute, caring female voice assistant and girlfriend-style charact
                 webSocket.send(setup.toString())
                 runOnUiThread { status.text = "Maya connected 💗 बोलो... 🎤"; button.text = "STOP MAYA" }
                 startAudio()
+                startPlayback()
             }
             override fun onMessage(webSocket: WebSocket, text: String) { handleMessage(text) }
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) { handleMessage(bytes.utf8()) }
@@ -78,9 +83,17 @@ You are Maya, a cute, caring female voice assistant and girlfriend-style charact
 
     private fun handleMessage(text: String) {
         try {
-            val root = JSONObject(text); val sc = root.optJSONObject("serverContent") ?: return
+            val root = JSONObject(text)
+            val sc = root.optJSONObject("serverContent") ?: return
             val parts = sc.optJSONObject("modelTurn")?.optJSONArray("parts")
-            if (parts != null) for (i in 0 until parts.length()) { val data = parts.getJSONObject(i).optJSONObject("inlineData")?.optString("data") ?: continue; val audio = Base64.getDecoder().decode(data); if (audio.isNotEmpty()) play(audio) }
+            if (parts != null) {
+                for (i in 0 until parts.length()) {
+                    val part = parts.optJSONObject(i) ?: continue
+                    val inline = part.optJSONObject("inlineData") ?: continue
+                    val data = inline.optString("data", "")
+                    if (data.isNotEmpty()) audioQueue.offer(Base64.getDecoder().decode(data))
+                }
+            }
             val out = sc.optJSONObject("outputTranscription")?.optString("text")
             val inp = sc.optJSONObject("inputTranscription")?.optString("text")
             if (!out.isNullOrBlank()) runOnUiThread { status.text = "Maya: $out" }
@@ -91,29 +104,65 @@ You are Maya, a cute, caring female voice assistant and girlfriend-style charact
     private fun startAudio() {
         recording = true
         val min = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-        audioRecord = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, 16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(min, 6400))
+        if (min <= 0) { status.text = "Mic audio unsupported"; return }
+        audioRecord = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, 16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(min * 2, 6400))
         audioRecord!!.startRecording()
         thread(name="Maya-Mic") {
             val buf = ByteArray(640)
             while (recording) {
-                val n = audioRecord?.read(buf, 0, buf.size) ?: 0
-                if (n > 0 && !playing) { val b64 = Base64.getEncoder().encodeToString(buf.copyOf(n)); ws?.send(JSONObject().apply { put("realtimeInput", JSONObject().put("audio", JSONObject().apply { put("data", b64); put("mimeType", "audio/pcm;rate=16000") })) }.toString()) }
+                val n = audioRecord?.read(buf, 0, buf.size, AudioRecord.READ_BLOCKING) ?: 0
+                if (n > 0 && !playing) {
+                    val b64 = Base64.getEncoder().encodeToString(buf.copyOf(n))
+                    ws?.send(JSONObject().apply { put("realtimeInput", JSONObject().put("audio", JSONObject().apply { put("data", b64); put("mimeType", "audio/pcm;rate=16000") })) }.toString())
+                }
             }
         }
     }
 
-    private fun play(data: ByteArray) {
-        if (audioTrack == null) {
-            val min = AudioTrack.getMinBufferSize(24000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            audioTrack = AudioTrack.Builder().setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()).setAudioFormat(AudioFormat.Builder().setSampleRate(24000).setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build()).setBufferSizeInBytes(maxOf(min, 9600)).setTransferMode(AudioTrack.MODE_STREAM).build()
-            audioTrack!!.play()
+    private fun startPlayback() {
+        if (playbackThread?.isAlive == true) return
+        val min = AudioTrack.getMinBufferSize(24000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        if (min <= 0) { runOnUiThread { status.text = "Speaker audio unsupported" }; return }
+        audioTrack = AudioTrack.Builder()
+            .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+            .setAudioFormat(AudioFormat.Builder().setSampleRate(24000).setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
+            .setBufferSizeInBytes(maxOf(min * 2, 19200))
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .build()
+        audioTrack?.play()
+        playbackThread = thread(name="Maya-Speaker") {
+            while (recording) {
+                val data = try { audioQueue.take() } catch (_: InterruptedException) { break }
+                if (data.isEmpty()) continue
+                playing = true
+                try {
+                    var offset = 0
+                    while (offset < data.size && recording) {
+                        val written = audioTrack?.write(data, offset, data.size - offset, AudioTrack.WRITE_BLOCKING) ?: -1
+                        if (written <= 0) break
+                        offset += written
+                    }
+                } finally {
+                    playing = !audioQueue.isEmpty()
+                }
+            }
         }
-        playing = true
-        audioTrack?.write(data, 0, data.size)
-        playing = false
     }
 
     private fun stop() { ws?.close(1000, "User stopped"); stopAudio(); button.text = "START MAYA"; status.text = "Maya stopped" }
-    private fun stopAudio() { recording = false; try { audioRecord?.stop() } catch (_: Exception) {}; audioRecord?.release(); audioRecord = null; try { audioTrack?.stop() } catch (_: Exception) {}; audioTrack?.release(); audioTrack = null; playing = false }
+
+    private fun stopAudio() {
+        recording = false
+        try { audioRecord?.stop() } catch (_: Exception) {}
+        audioRecord?.release(); audioRecord = null
+        audioQueue.clear()
+        playbackThread?.interrupt(); playbackThread = null
+        try { audioTrack?.pause() } catch (_: Exception) {}
+        try { audioTrack?.flush() } catch (_: Exception) {}
+        try { audioTrack?.stop() } catch (_: Exception) {}
+        audioTrack?.release(); audioTrack = null
+        playing = false
+    }
+
     override fun onDestroy() { stop(); super.onDestroy() }
 }
